@@ -11,6 +11,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.File;
 import java.util.Map;
 
 public class ShellUtils {
@@ -19,6 +20,7 @@ public class ShellUtils {
         private boolean combineStdoutStderr = false;
         private Map<String, String> env = null;
         private InputStream stdin = null;
+        private String cwd = null;
 
         public boolean getCombineStdoutStderr() {
             return combineStdoutStderr;
@@ -42,6 +44,14 @@ public class ShellUtils {
 
         public void setEnv(Map<String, String> env) {
             this.env = env;
+        }
+
+        public String getWorkingDirectory() {
+            return cwd;
+        }
+
+        public void setWorkingDirectory(String cwd) {
+            this.cwd = cwd;
         }
     }
 
@@ -91,6 +101,12 @@ public class ShellUtils {
 
         // Set up the handlers
         executor.setStreamHandler(streamHandler);
+
+        // Set up cwd
+        String cwd = options.getWorkingDirectory();
+        if (cwd != null) {
+            executor.setWorkingDirectory(new File(cwd));
+        }
 
         Integer exitCode = executor.execute(commandLine, options.getEnv());
 

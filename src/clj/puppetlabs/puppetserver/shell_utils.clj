@@ -27,7 +27,8 @@
 (def ExecutionOptions
   {(schema/optional-key :args) [schema/Str]
    (schema/optional-key :env) (schema/maybe {schema/Str schema/Str})
-   (schema/optional-key :in) (schema/maybe InputStream)})
+   (schema/optional-key :in) (schema/maybe InputStream)
+   (schema/optional-key :cwd) (schema/maybe schema/Str)})
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Internal
@@ -35,14 +36,17 @@
 (def default-execution-options
   {:args []
    :env nil
-   :in nil})
+   :in nil
+   :cwd nil})
 
 (schema/defn ^:always-validate java-exe-options :- ShellUtils$ExecutionOptions
-  [{:keys [env in]} :- ExecutionOptions]
+  [{:keys [env in cwd]} :- ExecutionOptions]
   (let [exe-options (ShellUtils$ExecutionOptions.)]
     (.setStdin exe-options in)
     (when env
       (.setEnv exe-options (ks/mapkeys name env)))
+    (when cwd
+      (.setWorkingDirectory exe-options cwd))
     exe-options))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

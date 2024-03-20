@@ -104,6 +104,13 @@
                              {:in (ByteArrayInputStream.
                                    (.getBytes "foo" "UTF-8"))}))))))
 
+(deftest sets-cwd-correctly
+  (testing "sets current working directory correctly"
+    (let [tmpdir (System/getProperty "java.io.tmpdir")]
+      (is (= (str tmpdir "\n") (:stdout (sh-utils/execute-command
+                                         (script-path "echo_cwd")
+                                         {:cwd tmpdir})))))))
+
 (deftest throws-exception-for-non-absolute-path
   (testing "Commands must be given using absolute paths"
     (is (thrown? IllegalArgumentException
