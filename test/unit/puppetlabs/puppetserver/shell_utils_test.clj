@@ -134,3 +134,59 @@
     (is (= 128000 (count (:stdout (sh-utils/execute-command
                                    (script-path "gen-output")
                                    {:args ["128000"]})))))))
+
+(deftest no-timeout-configured-preserves-existing-behavior
+  (testing "without :timeout-ms, execution blocks until the process exits and :timed-out is false"
+    (let [result (sh-utils/execute-command
+                  (script-path "echo")
+                  {:args ["foo"]})]
+      (is (= "foo\n" (:stdout result)))
+      (is (zero? (:exit-code result)))
+      (is (false? (:timed-out result))))))
+
+(deftest completes-normally-within-timeout
+  (testing "a process that finishes well within its :timeout-ms completes normally"
+    (let [result (sh-utils/execute-command
+                  (script-path "sleep_then_echo")
+                  {:args ["0"]
+                   :timeout-ms 10000})]
+      (is (= "finished\n" (:stdout result)))
+      (is (zero? (:exit-code result)))
+      (is (false? (:timed-out result))))))
+
+(deftest killed-for-exceeding-timeout
+  (testing "a process that exceeds its :timeout-ms is forcibly terminated"
+    (let [start (System/currentTimeMillis)
+          result (sh-utils/execute-command
+                  (script-path "sleep_then_echo")
+                  {:args ["10"]
+                   :timeout-ms 200})
+          elapsed (- (System/currentTimeMillis) start)]
+      (testing ":timed-out is true, distinguishing this from normal completion"
+        (is (true? (:timed-out result))))
+      (testing "the process was actually terminated, not merely outrun by the caller"
+        ;; if the process were allowed to run to completion, this test would
+        ;; take at least 10 seconds and stdout would contain "finished\n"
+        (is (< elapsed 5000)
+            (str "expected the call to return well before the process's 10s "
+                 "sleep completed, but it took " elapsed "ms"))
+        (is (not (re-find #"finished" (:stdout result)))
+            "the process should have been killed before it could echo, proving it did not merely complete on its own")))))
+
+(deftest killed-with-vanishingly-small-timeout
+  (testing "an extremely small :timeout-ms still results in the process being terminated"
+    ;; a :timeout-ms this small may expire before the process has even
+    ;; finished being launched, which exercises the retry/poll used to obtain
+    ;; a Process handle to terminate after the timeout fires.
+    (let [start (System/currentTimeMillis)
+          result (sh-utils/execute-command
+                  (script-path "sleep_then_echo")
+                  {:args ["10"]
+                   :timeout-ms 1})
+          elapsed (- (System/currentTimeMillis) start)]
+      (is (true? (:timed-out result)))
+      (is (< elapsed 5000)
+          (str "expected the call to return well before the process's 10s "
+               "sleep completed, but it took " elapsed "ms"))
+      (is (not (re-find #"finished" (:stdout result)))
+          "the process should have been killed before it could echo"))))
