@@ -1,5 +1,6 @@
 package com.puppetlabs.puppetserver;
 
+import org.apache.commons.exec.DefaultExecuteResultHandler;
 import org.apache.commons.exec.DefaultExecutor;
 import org.apache.commons.exec.PumpStreamHandler;
 import org.apache.commons.exec.CommandLine;
@@ -12,7 +13,9 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.File;
+import java.time.Duration;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class ShellUtils {
 
@@ -21,6 +24,7 @@ public class ShellUtils {
         private Map<String, String> env = null;
         private InputStream stdin = null;
         private String cwd = null;
+        private Long timeoutMillis = null;
 
         public boolean getCombineStdoutStderr() {
             return combineStdoutStderr;
@@ -28,6 +32,21 @@ public class ShellUtils {
 
         public void setCombineStdoutStderr(boolean combineStdoutStderr) {
             this.combineStdoutStderr = combineStdoutStderr;
+        }
+
+        /**
+         * The maximum amount of time, in milliseconds, to allow the process to
+         * run before it is forcibly terminated. A value of {@code null} (the
+         * default) means no timeout is enforced and the caller will block on
+         * the process indefinitely, matching the historical behavior of this
+         * class.
+         */
+        public Long getTimeoutMillis() {
+            return timeoutMillis;
+        }
+
+        public void setTimeoutMillis(Long timeoutMillis) {
+            this.timeoutMillis = timeoutMillis;
         }
 
         public InputStream getStdin() {
@@ -57,14 +76,55 @@ public class ShellUtils {
 
     private static final Logger log = LoggerFactory.getLogger(ShellUtils.class);
 
+    // Once a timed-out process has been sent destroyForcibly() (SIGKILL on
+    // POSIX systems), this is how long we're willing to wait for commons-exec's
+    // own bookkeeping thread to notice the process has exited and finish
+    // tearing down its stream pumps before we give up and return whatever
+    // output was captured so far. SIGKILL cannot be blocked, deferred, or
+    // ignored by the target process, so in practice this returns almost
+    // immediately; the bound exists only as a defensive backstop against
+    // pathological OS-level hangs (e.g. a process stuck in uninterruptible
+    // I/O wait) so that a caller's configured timeout can never be turned
+    // into an unbounded one by this bookkeeping step.
+    private static final long POST_KILL_GRACE_PERIOD_MILLIS = 5000;
+
+    // Polling interval used only by pollForProcess() below, while waiting for
+    // a launched Process reference to show up.
+    private static final long PROCESS_REF_POLL_INTERVAL_MILLIS = 10;
+
+    /**
+     * Polls the given reference for a non-null Process, for up to maxWaitMillis,
+     * sleeping briefly between checks. Used to guard against the narrow race
+     * where a caller's :timeout-ms is small enough that we notice the timeout
+     * before the background execution thread has recorded the Process it just
+     * launched.
+     *
+     * @return the Process once available, or null if maxWaitMillis elapses first.
+     */
+    private static Process pollForProcess(AtomicReference<Process> processRef, long maxWaitMillis)
+            throws InterruptedException {
+        long deadline = System.currentTimeMillis() + maxWaitMillis;
+        Process process;
+        while ((process = processRef.get()) == null && System.currentTimeMillis() < deadline) {
+            Thread.sleep(PROCESS_REF_POLL_INTERVAL_MILLIS);
+        }
+        return process;
+    }
+
     /**
      * Takes a prepared CommandLine instance and executes it using some sane
      * defaults and a DefaultExecutor. Also makes a delicious pancake.
      *
      * @param commandLine CommandLine instance to execute
      * @param options optional object [ExecutionOptions] to control behavior; may be null.
-     * @return An ExecutionResult with output[String], error[String], and
-     *                  the exit code[Integer] of the process
+     *                If options.getTimeoutMillis() is non-null, the process will be
+     *                forcibly terminated (via Process#destroyForcibly()) if it has not
+     *                completed within that many milliseconds, and the returned
+     *                ExecutionResult's isTimedOut() will be true. If it is null (the
+     *                default), the call blocks on the process indefinitely, as before.
+     * @return An ExecutionResult with output[String], error[String],
+     *                  the exit code[Integer] of the process, and whether the
+     *                  process was killed for exceeding its timeout[boolean]
      *
      * @throws InterruptedException
      * @throws IOException
@@ -75,7 +135,31 @@ public class ShellUtils {
         if (options == null) {
             options = new ExecutionOptions();
         }
-        DefaultExecutor executor = new DefaultExecutor();
+
+        final Long timeoutMillis = options.getTimeoutMillis();
+        // When a timeout is configured, capture a reference to the live
+        // Process as soon as it's launched, so that it can be forcibly
+        // terminated later if it overruns its timeout. Process#destroy()
+        // (used internally by commons-exec's own ExecuteWatchdog) merely
+        // sends SIGTERM, which some shells defer or ignore entirely while a
+        // foreground child of their own is running -- exactly the "hung
+        // policy-executable" scenario this timeout exists to guard against.
+        // destroyForcibly() (SIGKILL) cannot be deferred or ignored, so we
+        // manage the Process reference ourselves rather than relying on
+        // ExecuteWatchdog.
+        final AtomicReference<Process> processRef = new AtomicReference<>();
+        DefaultExecutor executor = (timeoutMillis == null)
+                ? new DefaultExecutor()
+                : new DefaultExecutor() {
+                    @Override
+                    protected Process launch(CommandLine command, Map<String, String> env, File dir)
+                            throws IOException {
+                        Process process = super.launch(command, env, dir);
+                        processRef.set(process);
+                        return process;
+                    }
+                };
+
         ByteArrayOutputStream errStream = new ByteArrayOutputStream();
         // TODO the nice thing here would be to set up a piped stream
         // arrangement like:
@@ -108,7 +192,54 @@ public class ShellUtils {
             executor.setWorkingDirectory(new File(cwd));
         }
 
-        Integer exitCode = executor.execute(commandLine, options.getEnv());
+        Integer exitCode;
+        boolean timedOut = false;
+
+        if (timeoutMillis == null) {
+            exitCode = executor.execute(commandLine, options.getEnv());
+        } else {
+            DefaultExecuteResultHandler resultHandler = new DefaultExecuteResultHandler();
+            executor.execute(commandLine, options.getEnv(), resultHandler);
+            resultHandler.waitFor(Duration.ofMillis(timeoutMillis));
+
+            if (resultHandler.hasResult()) {
+                exitCode = resultHandler.getExitValue();
+            } else {
+                timedOut = true;
+                log.warn("External command '" + commandLine.toString() + "' exceeded its " +
+                        timeoutMillis + "ms timeout and is being forcibly terminated");
+
+                // On a very small :timeout-ms, it's possible for the waitFor()
+                // above to expire before the background execution thread has
+                // actually reached our launch() override and recorded the
+                // Process. Poll briefly for it rather than giving up
+                // immediately -- launching is normally near-instantaneous
+                // once execute() has been invoked, so this should resolve
+                // within a handful of iterations in practice.
+                Process process = pollForProcess(processRef, POST_KILL_GRACE_PERIOD_MILLIS);
+                if (process != null) {
+                    process.destroyForcibly();
+                } else {
+                    log.warn("External command '" + commandLine.toString() + "' timed out, but " +
+                            "no Process handle was available to terminate; it may not have " +
+                            "finished starting yet");
+                }
+
+                resultHandler.waitFor(Duration.ofMillis(POST_KILL_GRACE_PERIOD_MILLIS));
+                if (resultHandler.hasResult()) {
+                    exitCode = resultHandler.getExitValue();
+                } else {
+                    log.warn("External command '" + commandLine.toString() + "' did not report " +
+                            "an exit status within " + POST_KILL_GRACE_PERIOD_MILLIS +
+                            "ms of being forcibly terminated; giving up on waiting for it");
+                    exitCode = -1;
+                }
+            }
+
+            if (resultHandler.hasResult() && resultHandler.getException() != null) {
+                throw resultHandler.getException();
+            }
+        }
 
         ByteArrayInputStream stdoutInputStream = new ByteArrayInputStream(stdoutOutputStream.toByteArray());
         String stdErr = errStream.toString();
@@ -117,7 +248,7 @@ public class ShellUtils {
             log.warn("Executed an external process which logged to STDERR: " + stdErr);
         }
 
-        return new ExecutionResult(stdoutInputStream, stdErr, exitCode);
+        return new ExecutionResult(stdoutInputStream, stdErr, exitCode, timedOut);
     }
 
     /**

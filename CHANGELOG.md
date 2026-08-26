@@ -1,3 +1,12 @@
+## 2.0.2
+
+* Add an optional `:timeout-ms` execution option to `execute-command` and
+  `execute-command-streamed`. When set, a process that runs longer than the
+  timeout is forcibly terminated (`Process#destroyForcibly()`) and the
+  result's new `:timed-out` entry is `true`. Omitting `:timeout-ms` preserves
+  prior behavior exactly (blocks indefinitely, `:timed-out` is always
+  `false`).
+
 ## 2.0.1 release version of 2.0.0
 ## 2.0.0 - not released
 * update to clj parent 7.3.15

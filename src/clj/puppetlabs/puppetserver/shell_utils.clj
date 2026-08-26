@@ -12,23 +12,30 @@
 ;;; Schemas
 
 (def ExecutionResult
-  "A map that contains the details of the result of executing a command."
+  "A map that contains the details of the result of executing a command.
+  :timed-out is true if the process was forcibly terminated for exceeding
+  a :timeout-ms configured via ExecutionOptions; false otherwise (including
+  when the process completed with a non-zero exit code, or when no
+  :timeout-ms was configured)."
   {:exit-code schema/Int
    :stderr schema/Str
-   :stdout schema/Str})
+   :stdout schema/Str
+   :timed-out schema/Bool})
 
 (def ExecutionResultStreamed
   "A map that contains the details of the result of executing a command with
-  stdout as a stream."
+  stdout as a stream. :timed-out has the same meaning as in ExecutionResult."
   {:exit-code schema/Int
    :stderr schema/Str
-   :stdout InputStream})
+   :stdout InputStream
+   :timed-out schema/Bool})
 
 (def ExecutionOptions
   {(schema/optional-key :args) [schema/Str]
    (schema/optional-key :env) (schema/maybe {schema/Str schema/Str})
    (schema/optional-key :in) (schema/maybe InputStream)
-   (schema/optional-key :cwd) (schema/maybe schema/Str)})
+   (schema/optional-key :cwd) (schema/maybe schema/Str)
+   (schema/optional-key :timeout-ms) (schema/maybe schema/Int)})
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Internal
@@ -37,16 +44,19 @@
   {:args []
    :env nil
    :in nil
-   :cwd nil})
+   :cwd nil
+   :timeout-ms nil})
 
 (schema/defn ^:always-validate java-exe-options :- ShellUtils$ExecutionOptions
-  [{:keys [env in cwd]} :- ExecutionOptions]
+  [{:keys [env in cwd timeout-ms]} :- ExecutionOptions]
   (let [exe-options (ShellUtils$ExecutionOptions.)]
     (.setStdin exe-options in)
     (when env
       (.setEnv exe-options (ks/mapkeys name env)))
     (when cwd
       (.setWorkingDirectory exe-options cwd))
+    (when timeout-ms
+      (.setTimeoutMillis exe-options (long timeout-ms)))
     exe-options))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -78,7 +88,14 @@
   execute-command-streamed :- ExecutionResultStreamed
   "Execute the specified fully qualified command (string) and any included
   command-arguments (vector of strings) and return the exit-code (integer),
-  and the contents of the stdout (stream) and stderr (string) for the command."
+  the contents of the stdout (stream) and stderr (string) for the command,
+  and whether the process was killed for exceeding its timeout (boolean).
+
+  If opts includes a :timeout-ms value, the process will be forcibly
+  terminated if it has not completed within that many milliseconds, and
+  :timed-out will be true in the result. If :timeout-ms is not provided
+  (the default), this call blocks on the process indefinitely, as before,
+  and :timed-out will always be false."
   ([command :- schema/Str]
    (execute-command-streamed command {}))
   ([command :- schema/Str
@@ -91,13 +108,18 @@
                     (java-exe-options opts))]
        {:exit-code (.getExitCode process)
         :stderr (.getError process)
-        :stdout (.getOutputAsStream process)}))))
+        :stdout (.getOutputAsStream process)
+        :timed-out (.isTimedOut process)}))))
 
 (schema/defn ^:always-validate
   execute-command :- ExecutionResult
   "Execute the specified fully qualified command (string) and any included
   command-arguments (vector of strings) and return the exit-code (integer),
-  and the contents of the stdout (string) and stderr (string) for the command."
+  the contents of the stdout (string) and stderr (string) for the command,
+  and whether the process was killed for exceeding its timeout (boolean).
+
+  See execute-command-streamed for details on the optional :timeout-ms entry
+  in opts and the :timed-out entry in the result."
   ([command :- schema/Str]
    (execute-command command {}))
   ([command :- schema/Str
